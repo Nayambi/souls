@@ -5,41 +5,19 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="86f72de6-208f-435a-90f1-6367e1e811c0" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.env.example" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/souls.iml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/vcs.xml" beforeDir="false" />
+      <change afterPath="$PROJECT_DIR$/app/core/breeth.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/tests/test_breeth.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.env.example" beforeDir="false" afterPath="$PROJECT_DIR$/.env.example" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/PROMPT.md" beforeDir="false" afterPath="$PROJECT_DIR$/PROMPT.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/__init__.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/api/__init__.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/api/routes_feed.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/api/routes_init.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/core/__init__.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/core/agent_cycle.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/core/discovery.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/core/editorial.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/core/llm_client.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/core/persona.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/core/writer.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/main.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/scheduling/__init__.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/scheduling/scheduler.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/schemas/__init__.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/schemas/api_models.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/storage/__init__.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/storage/db.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/storage/models.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/storage/repository.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/agent.db" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/scheduler.db" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/pytest.ini" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/test_discovery.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/test_editorial.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/test_feed_ordering.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/core/agent_cycle.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/core/agent_cycle.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/scheduling/scheduler.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/scheduling/scheduler.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/storage/db.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/storage/db.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/data/agent.db" beforeDir="false" afterPath="$PROJECT_DIR$/data/agent.db" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/data/scheduler.db" beforeDir="false" afterPath="$PROJECT_DIR$/data/scheduler.db" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_feed_ordering.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_feed_ordering.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />

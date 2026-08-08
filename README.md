@@ -8,11 +8,11 @@ do tempo sem intervenção humana.
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# edita .env e mete a tua ANTHROPIC_API_KEY
+# edita .env e mete a tua GEMINI_API_KEY e GEMINI_MODEL
 
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
@@ -29,7 +29,8 @@ curl "http://localhost:8000/api/agent/feed?agentId=<agentId devolvido acima>"
 
 O primeiro ciclo de publicação corre ~30s depois do `/init`. Os ciclos
 seguintes correm a cada ~4h (com jitter de até 45 min) — ver
-`app/scheduling/scheduler.py` para ajustar `PUBLISH_INTERVAL_HOURS`.
+`app/scheduling/scheduler.py` ou variáveis `FIRST_RUN_DELAY_SECONDS`,
+`PUBLISH_INTERVAL_MINUTES` e `PUBLISH_JITTER_SECONDS` no `.env`.
 
 ## Testes
 
@@ -41,6 +42,7 @@ pytest tests/ -v
 
 - O processo tem de ficar vivo continuamente (não usar serverless que
   "adormece" entre requests) para o scheduler continuar a correr.
+- Configura `GEMINI_API_KEY` e `GEMINI_MODEL` no ambiente de deploy.
 - SQLite em WAL mode aguenta bem leituras concorrentes (`/feed`) com uma
   escrita periódica (ciclo do scheduler) num único processo.
 - `app/core/discovery.py` depende de acesso de saída livre à internet

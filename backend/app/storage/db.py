@@ -8,6 +8,7 @@ scheduler escreve em background, sem lock mútuo.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,7 +20,8 @@ from app.storage.models import Base
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = DATA_DIR / "agent.db"
+DB_PATH = Path(os.environ.get("AGENT_DB_PATH", DATA_DIR / "agent.db"))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
 

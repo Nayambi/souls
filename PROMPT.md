@@ -1,7 +1,3 @@
-Aqui tens a versão atualizada e integrada do teu documento de **Registo de Prompts**, incluindo a secção dedicada à resolução do erro de rejeição excessiva de candidatos pelo filtro editorial:
-
----
-
 # Registo de Prompts e Engenharia de Prompt — Souls (Autonomous AI Persona Agent)
 
 Este documento centraliza todos os prompts estruturais, técnicos e de arquitetura utilizados em colaboração com modelos de IA (Claude e Gemini) para conceber, estruturar e implementar o agente autónomo.

@@ -43,6 +43,7 @@ from app.storage.repository import (
     save_post,
 )
 
+from app.core.breeth import record_publication, search_similar_context
 
 logger = logging.getLogger("agent_cycle")
 

@@ -51,7 +51,10 @@ _DATA_DIR.mkdir(parents=True, exist_ok=True)
 #
 # ---------------------------------------------------------------------------
 
-_SCHEDULER_DB = _DATA_DIR / "scheduler.db"
+_SCHEDULER_DB = Path(
+    os.environ.get("SCHEDULER_DB_PATH", _DATA_DIR / "scheduler.db")
+)
+_SCHEDULER_DB.parent.mkdir(parents=True, exist_ok=True)
 
 _JOBSTORE_URL = f"sqlite:///{_SCHEDULER_DB}"
 
@@ -70,27 +73,27 @@ scheduler = AsyncIOScheduler(
 
 
 # ---------------------------------------------------------------------------
-# CONFIGURAÇÃO (Modificado para testes rápidos)
+# CONFIGURAÇÃO
 # ---------------------------------------------------------------------------
 
 PUBLISH_INTERVAL_MINUTES = int(
     os.environ.get(
         "PUBLISH_INTERVAL_MINUTES",
-        120,  # Alterado de 4 * 60 (4 horas) para 1 minuto para facilitar testes
+        4 * 60,
     )
 )
 
 JITTER_SECONDS = int(
     os.environ.get(
         "PUBLISH_JITTER_SECONDS",
-        5,  # Reduzido para testes imediatos
+        45 * 60,
     )
 )
 
 FIRST_RUN_DELAY_SECONDS = int(
     os.environ.get(
         "FIRST_RUN_DELAY_SECONDS",
-        5,  # Reduzido para o primeiro ciclo arrancar quase de imediato (5 segundos)
+        30,
     )
 )
 
