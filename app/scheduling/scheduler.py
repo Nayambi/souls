@@ -76,7 +76,7 @@ scheduler = AsyncIOScheduler(
 PUBLISH_INTERVAL_MINUTES = int(
     os.environ.get(
         "PUBLISH_INTERVAL_MINUTES",
-        1,  # Alterado de 4 * 60 (4 horas) para 1 minuto para facilitar testes
+        120,  # Alterado de 4 * 60 (4 horas) para 1 minuto para facilitar testes
     )
 )
 
