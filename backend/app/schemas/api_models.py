@@ -31,3 +31,7 @@ PostOutput = PostOut
 
 class FeedResponse(BaseModel):
     posts: list[PostOut]
+
+
+class TickResponse(BaseModel):
+    processed: int

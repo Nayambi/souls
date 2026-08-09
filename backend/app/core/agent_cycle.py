@@ -10,16 +10,23 @@ judge()
     ↓
 escolher melhor candidato
     ↓
-write()
+write() [com contexto de posts recentes + nota de alternativas rejeitadas]
     ↓
 save_post()
+    ↓
+agendar o próximo ciclo (45min-3h a partir de agora)
 
-Este módulo não depende directamente de FastAPI.
+Este módulo não depende directamente de FastAPI, e não depende do
+scheduler (app/scheduling/scheduler.py importa DESTE módulo, nunca o
+contrário — evita import circular).
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import random
+from datetime import datetime, timedelta, timezone
 
 from app.core.discovery import (
     TopicCandidate,
@@ -36,11 +43,14 @@ from app.core.persona import (
 from app.core.writer import write_post
 
 from app.storage.repository import (
+    claim_due_agent_ids,
     get_agent,
+    get_recent_published_posts,
     get_recent_published_summaries,
     get_recent_topic_keys,
     record_topic_evaluation,
     save_post,
+    set_next_cycle_at,
 )
 
 from app.core.breeth import record_publication, search_similar_context
@@ -49,6 +59,18 @@ logger = logging.getLogger("agent_cycle")
 
 
 MAX_CANDIDATES_TO_JUDGE = 8
+
+# Nº de posts recentes (texto completo) mostrados ao writer como
+# contexto, para não repetir ângulo/conteúdo já publicado.
+MAX_RECENT_POSTS_FOR_WRITER = 5
+
+# Janela de agendamento do próximo ciclo. Um intervalo fixo faria todos
+# os agentes publicarem em cadência previsível; aleatorizar entre
+# 45min e 3h é o que dá o comportamento "autónomo" pedido, sem nunca
+# deixar um agente parado indefinidamente nem publicar demasiado
+# depressa.
+NEXT_CYCLE_MIN_MINUTES = int(os.environ.get("NEXT_CYCLE_MIN_MINUTES", 45))
+NEXT_CYCLE_MAX_MINUTES = int(os.environ.get("NEXT_CYCLE_MAX_MINUTES", 180))
 
 
 # ---------------------------------------------------------------------------
@@ -94,15 +116,87 @@ async def _persona_for_agent(agent_id: str) -> Persona:
 
 
 # ---------------------------------------------------------------------------
+# AGENDAMENTO DO PRÓXIMO CICLO
+# ---------------------------------------------------------------------------
+
+def _pick_next_interval() -> timedelta:
+    """Escolhe um intervalo aleatório dentro da janela 45min-3h."""
+    minutes = random.uniform(NEXT_CYCLE_MIN_MINUTES, NEXT_CYCLE_MAX_MINUTES)
+    return timedelta(minutes=minutes)
+
+
+async def _schedule_next_cycle(agent_id: str) -> None:
+    """
+    Agenda o próximo ciclo deste agente a partir de agora. Chamado
+    sempre no fim de run_publishing_cycle (sucesso OU falha) — ver
+    comentário em run_publishing_cycle sobre porquê isto vive num
+    finally.
+    """
+    next_run = datetime.now(timezone.utc) + _pick_next_interval()
+
+    await set_next_cycle_at(agent_id, next_run)
+
+    logger.info(
+        "[%s] Próximo ciclo agendado para %s",
+        agent_id,
+        next_run.isoformat(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# NOTA DE ALTERNATIVAS REJEITADAS
+# ---------------------------------------------------------------------------
+
+def _build_alternatives_note(
+    rejected: list[tuple[TopicCandidate, EditorialDecision]],
+) -> str:
+    """
+    Constrói uma nota textual sobre os candidatos que foram avaliados
+    neste mesmo ciclo mas NÃO escolhidos (rejeitados pelo editorial
+    judgment, ou com score inferior ao vencedor). Passada ao writer
+    como contexto adicional — não para os mencionar no post, mas para
+    que o ângulo escolhido para o tópico vencedor seja implicitamente
+    calibrado sabendo o que mais estava "na mesa" e porquê não foi
+    esse o escolhido.
+
+    Devolve uma string vazia com uma nota neutra quando não houve
+    alternativas (só um candidato foi avaliado, ou nenhum foi
+    rejeitado).
+    """
+    if not rejected:
+        return "(nenhuma alternativa foi avaliada e rejeitada neste ciclo)"
+
+    lines = []
+    for candidate, decision in rejected:
+        lines.append(
+            f"- \"{candidate.title}\" (fonte: {candidate.source_name}) — "
+            f"não escolhido: {decision.reasoning}"
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ENTRY POINT
 # ---------------------------------------------------------------------------
 
 async def run_publishing_cycle(agent_id: str) -> None:
     """
-    Ponto de entrada utilizado pelo APScheduler.
+    Ponto de entrada utilizado pelo poller interno e por
+    POST /api/agent/tick.
 
-    Excepções são capturadas aqui para que um ciclo falhado
-    não mate o scheduler.
+    Excepções são capturadas aqui para que um ciclo falhado não pare o
+    poller nem impeça os restantes agentes devidos no mesmo tick de
+    correrem.
+
+    O reagendamento do próximo ciclo (_schedule_next_cycle) corre num
+    finally: acontece sempre, quer o ciclo tenha tido sucesso, tenha
+    sido abortado sem candidatos aprovados, ou tenha rebentado com uma
+    excepção. Isto é o que garante que um agente nunca fica "preso" —
+    sem isto, uma falha a meio deixaria next_cycle_at parado no
+    marcador provisório de claim_due_agent_ids (30 min), e o agente
+    seria reivindicado repetidamente em loop apertado até o próximo
+    sucesso.
     """
 
     logger.info(
@@ -128,9 +222,46 @@ async def run_publishing_cycle(agent_id: str) -> None:
             agent_id,
         )
 
+    finally:
+        try:
+            await _schedule_next_cycle(agent_id)
+        except Exception:
+            logger.exception(
+                "[%s] ERRO AO AGENDAR O PRÓXIMO CICLO",
+                agent_id,
+            )
+
     logger.info(
         "=================================================="
     )
+
+
+async def run_due_cycles(limit: int = 50) -> int:
+    """
+    Reivindica atomicamente os agentes devidos neste momento
+    (claim_due_agent_ids) e corre o ciclo de publicação para cada um,
+    sequencialmente. Chamado pelo poller interno a cada tick e por
+    POST /api/agent/tick.
+
+    Devolve o número de agentes processados neste tick.
+    """
+    now = datetime.now(timezone.utc)
+
+    due_agent_ids = await claim_due_agent_ids(now=now, limit=limit)
+
+    if not due_agent_ids:
+        return 0
+
+    logger.info(
+        "Tick: %d agente(s) devido(s) | ids=%s",
+        len(due_agent_ids),
+        due_agent_ids,
+    )
+
+    for agent_id in due_agent_ids:
+        await run_publishing_cycle(agent_id)
+
+    return len(due_agent_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +367,11 @@ async def _run_cycle_unsafe(agent_id: str) -> None:
     best_decision: EditorialDecision | None = None
     best_candidate: TopicCandidate | None = None
 
+    # Candidatos avaliados mas não escolhidos (rejeitados, ou aprovados
+    # mas superados por um score melhor) — alimenta
+    # _build_alternatives_note para dar contexto ao writer.
+    rejected_evaluations: list[tuple[TopicCandidate, EditorialDecision]] = []
+
     candidates_to_judge = fresh_candidates[
         :MAX_CANDIDATES_TO_JUDGE
     ]
@@ -292,6 +428,7 @@ async def _run_cycle_unsafe(agent_id: str) -> None:
                     candidate.title,
                 )
 
+                rejected_evaluations.append((candidate, decision))
                 continue
 
             if (
@@ -299,6 +436,11 @@ async def _run_cycle_unsafe(agent_id: str) -> None:
                 or decision.relevance_score
                 > best_decision.relevance_score
             ):
+                # O anterior "melhor" (se existir) passa a alternativa
+                # rejeitada — foi aprovado mas superado.
+                if best_decision is not None and best_candidate is not None:
+                    rejected_evaluations.append((best_candidate, best_decision))
+
                 best_decision = decision
                 best_candidate = candidate
 
@@ -308,6 +450,8 @@ async def _run_cycle_unsafe(agent_id: str) -> None:
                     candidate.title,
                     decision.relevance_score,
                 )
+            else:
+                rejected_evaluations.append((candidate, decision))
 
         except Exception:
             logger.exception(
@@ -347,10 +491,19 @@ async def _run_cycle_unsafe(agent_id: str) -> None:
         agent_id,
     )
 
+    recent_posts = await get_recent_published_posts(
+        agent_id,
+        limit=MAX_RECENT_POSTS_FOR_WRITER,
+    )
+
+    alternatives_note = _build_alternatives_note(rejected_evaluations)
+
     written = await write_post(
         persona,
         best_candidate,
         best_decision,
+        recent_posts=recent_posts,
+        alternatives_note=alternatives_note,
     )
 
     logger.info(
@@ -383,4 +536,3 @@ async def _run_cycle_unsafe(agent_id: str) -> None:
         saved.id,
         best_candidate.title,
     )
-

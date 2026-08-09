@@ -61,4 +61,6 @@ Este documento centraliza todos os prompts estruturais, técnicos e de arquitetu
 > Preciso de saber:
 > 1. Como posso ajustar o prompt do sistema (`EDITORIAL_SYSTEM_TEMPLATE`) ou os critérios de pontuação para evitar rejeições excessivas em cascata, mantendo o rigor técnico?
 > 2. Que estratégia posso implementar para debugar ou fazer um "fallback" temporário (por exemplo, aprovar o candidato com maior pontuação ou baixar o limiar mínimo de score) para garantir que consigo testar a geração de posts e popular o feed de imediato?
->
+
+gemini:
+Podes explicar detalhadamente como funciona o módulo Breeth no nosso backend? Gostaria de saber qual é o seu principal objetivo, que componentes ou funções interage (como os agentes ou o LLM) e como é o seu fluxo de execução passo a passo

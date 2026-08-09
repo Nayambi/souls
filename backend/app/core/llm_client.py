@@ -1,4 +1,3 @@
-
 """
 Cliente centralizado para a API do Gemini.
 
@@ -6,26 +5,41 @@ Mantém a mesma interface estruturada utilizada pelo agente:
     - call_claude_structured()
     - call_claude_text()
 
-Internamente utiliza o Google Gen AI SDK (google-genai).
+Internamente utiliza o Google Gen AI SDK (google-genai), com:
+    - chamadas verdadeiramente assíncronas (client.aio)
+    - rate limiting local (RPM) partilhado por todo o processo
+    - retry com exponential backoff + jitter apenas para 429 (quota)
+    - erros não retryable (404, 401/403, etc.) propagados de imediato
 
 Configuração através de .env:
 
     GEMINI_API_KEY=...
     GEMINI_MODEL=gemini-2.0-flash
+    GEMINI_RPM=15                # opcional, default 15
 
 O modelo nunca é hardcoded como fallback.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Type
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from pydantic import BaseModel
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -39,21 +53,9 @@ logger = logging.getLogger("llm_client")
 # ENVIRONMENT
 # ---------------------------------------------------------------------------
 
-# Procura o .env a partir da raiz do projeto.
-#
-# Estrutura esperada:
-#
-# souls/
-# ├── .env
-# ├── app/
-# │   └── core/
-# │       └── llm_client.py
-#
 BASE_DIR = Path(__file__).resolve().parents[2]
 ENV_FILE = BASE_DIR / ".env"
 
-# override=True garante que o valor do .env substitui uma variável
-# GEMINI_MODEL antiga que eventualmente esteja definida no Windows.
 load_dotenv(ENV_FILE, override=True)
 
 
@@ -63,6 +65,7 @@ load_dotenv(ENV_FILE, override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL")
+GEMINI_RPM = int(os.getenv("GEMINI_RPM", "15"))
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +90,9 @@ def _validate_configuration() -> None:
         )
 
     logger.info(
-        "Configuração Gemini carregada | model=%s | env=%s",
+        "Configuração Gemini carregada | model=%s | rpm=%d | env=%s",
         GEMINI_MODEL,
+        GEMINI_RPM,
         ENV_FILE,
     )
 
@@ -103,8 +107,6 @@ _client: Optional[genai.Client] = None
 def _get_client() -> genai.Client:
     """
     Inicializa e devolve o cliente Gemini.
-
-    O cliente é criado apenas uma vez.
     """
 
     global _client
@@ -142,13 +144,6 @@ def _get_client() -> genai.Client:
 def _get_model_name() -> str:
     """
     Devolve exclusivamente o modelo configurado no .env.
-
-    Não existem modelos hardcoded de fallback.
-
-    Exemplo:
-
-        GEMINI_MODEL=gemini-2.0-flash
-
     """
 
     model = os.getenv("GEMINI_MODEL")
@@ -173,11 +168,6 @@ def _get_model_name() -> str:
 def list_available_models() -> list[str]:
     """
     Lista modelos disponíveis para a API key atual.
-
-    Retorna apenas modelos que suportam generateContent.
-
-    Esta função é útil para diagnóstico e não é chamada
-    automaticamente em cada request.
     """
 
     client = _get_client()
@@ -193,12 +183,7 @@ def list_available_models() -> list[str]:
             if not name:
                 continue
 
-            # Normaliza:
-            # models/gemini-2.0-flash
-            # ->
-            # gemini-2.0-flash
             name = name.removeprefix("models/")
-
             available.append(name)
 
         return sorted(set(available))
@@ -216,10 +201,6 @@ def list_available_models() -> list[str]:
 def validate_configured_model() -> str:
     """
     Verifica se GEMINI_MODEL aparece entre os modelos disponíveis.
-
-    Não altera automaticamente o modelo.
-
-    Retorna o modelo configurado quando válido.
     """
 
     model = _get_model_name()
@@ -247,54 +228,54 @@ def validate_configured_model() -> str:
 
 
 # ---------------------------------------------------------------------------
-# ERROR HANDLING
+# ERROR CLASSIFICATION
 # ---------------------------------------------------------------------------
 
-def _raise_gemini_error(exc: Exception, model: str) -> None:
+class GeminiRateLimitError(RuntimeError):
     """
-    Converte erros da API em mensagens mais úteis para o Souls.
+    429 / RESOURCE_EXHAUSTED (Retryable).
+    """
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class GeminiFatalError(RuntimeError):
+    """
+    404, 401/403 e outros erros não recuperáveis por retry.
+    """
+
+
+def _classify_gemini_error(exc: Exception, model: str) -> Exception:
+    """
+    Converte uma exceção crua do SDK numa exceção classificada.
     """
 
     error_text = str(exc)
-
-    # ---------------------------------------------------------------
-    # 429 - QUOTA / RESOURCE EXHAUSTED
-    # ---------------------------------------------------------------
 
     if (
         "429" in error_text
         or "RESOURCE_EXHAUSTED" in error_text
         or "ResourceExhausted" in error_text
     ):
-        raise RuntimeError(
+        return GeminiRateLimitError(
             "Quota do Gemini esgotada.\n\n"
             f"Modelo: {model}\n"
             "Erro: 429 RESOURCE_EXHAUSTED\n\n"
-            "Isto não significa necessariamente que o modelo "
-            "deixou de existir. Significa que a quota disponível "
-            "para esta API key/modelo foi atingida.\n\n"
-            "Altera GEMINI_MODEL no .env para outro modelo "
-            "disponível ou aguarda a reposição da quota."
-        ) from exc
-
-    # ---------------------------------------------------------------
-    # 404 - MODEL NOT FOUND
-    # ---------------------------------------------------------------
+            "A chamada será re-tentada automaticamente com backoff."
+        )
 
     if (
         "404" in error_text
         or "NOT_FOUND" in error_text
         or "NotFound" in error_text
     ):
-        raise RuntimeError(
+        return GeminiFatalError(
             "Modelo Gemini não encontrado.\n\n"
             f"Modelo configurado: {model}\n\n"
             "Verifica GEMINI_MODEL no .env."
-        ) from exc
-
-    # ---------------------------------------------------------------
-    # 401 / 403 - AUTHENTICATION
-    # ---------------------------------------------------------------
+        )
 
     if (
         "401" in error_text
@@ -302,19 +283,82 @@ def _raise_gemini_error(exc: Exception, model: str) -> None:
         or "PERMISSION_DENIED" in error_text
         or "UNAUTHENTICATED" in error_text
     ):
-        raise RuntimeError(
+        return GeminiFatalError(
             "Erro de autenticação/permissão na API Gemini.\n\n"
             "Verifica GEMINI_API_KEY."
-        ) from exc
+        )
 
-    # ---------------------------------------------------------------
-    # OTHER
-    # ---------------------------------------------------------------
-
-    raise RuntimeError(
+    return GeminiFatalError(
         f"Erro na API Gemini | model={model}\n"
         f"{error_text}"
-    ) from exc
+    )
+
+
+# ---------------------------------------------------------------------------
+# RATE LIMITER LOCAL (RPM)
+# ---------------------------------------------------------------------------
+
+class _AsyncRateLimiter:
+    """
+    Sliding-window rate limiter assíncrono.
+    """
+
+    def __init__(self, rpm: int):
+        self.rpm = rpm
+        self._timestamps: list[float] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            self._timestamps = [t for t in self._timestamps if now - t < 60]
+
+            while len(self._timestamps) >= self.rpm:
+                sleep_for = 60 - (now - self._timestamps[0])
+                await asyncio.sleep(max(sleep_for, 0.05))
+                now = time.monotonic()
+                self._timestamps = [t for t in self._timestamps if now - t < 60]
+
+            self._timestamps.append(now)
+
+
+_rate_limiter = _AsyncRateLimiter(rpm=GEMINI_RPM)
+
+
+# ---------------------------------------------------------------------------
+# CHAMADA BASE
+# ---------------------------------------------------------------------------
+
+@retry(
+    retry=retry_if_exception_type(GeminiRateLimitError),
+    wait=wait_exponential_jitter(initial=3, max=60, jitter=3),
+    stop=stop_after_attempt(5),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+async def _generate(
+    model: str,
+    contents: str,
+    config: types.GenerateContentConfig,
+):
+    """
+    Ponto único de chamada ao Gemini com rate limiting e retries.
+    """
+
+    client = _get_client()
+
+    await _rate_limiter.acquire()
+
+    try:
+        response = await client.aio.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+        return response
+
+    except Exception as exc:
+        raise _classify_gemini_error(exc, model) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -324,16 +368,16 @@ def _raise_gemini_error(exc: Exception, model: str) -> None:
 async def call_claude_structured(
     system_prompt: str,
     user_prompt: str,
-    max_tokens: int = 1024,
+    max_tokens: int = 2048,
+    response_schema: Optional[Type[BaseModel] | Any] = None,
 ) -> str:
     """
     Gera uma resposta estruturada em JSON.
 
-    Mantém o nome antigo 'call_claude_structured'
-    para preservar compatibilidade com o agente.
+    Permite passar opcionalmente uma classe Pydantic em `response_schema`
+    para forçar o Gemini a responder rigorosamente conforme a estrutura.
     """
 
-    client = _get_client()
     model = _get_model_name()
 
     logger.info(
@@ -341,26 +385,36 @@ async def call_claude_structured(
         model,
     )
 
+    config_kwargs = {
+        "system_instruction": system_prompt,
+        "max_output_tokens": max_tokens,
+        "response_mime_type": "application/json",
+    }
+
+    if response_schema is not None:
+        config_kwargs["response_schema"] = response_schema
+
     try:
-        response = client.models.generate_content(
+        response = await _generate(
             model=model,
             contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                max_output_tokens=max_tokens,
-                response_mime_type="application/json",
-            ),
+            config=types.GenerateContentConfig(**config_kwargs),
         )
 
         text = (response.text or "").strip()
 
-    except Exception as exc:
+    except GeminiFatalError:
         logger.exception(
-            "Erro na chamada estruturada ao Gemini | model=%s",
+            "Erro fatal na chamada estruturada ao Gemini | model=%s",
             model,
         )
+        raise
 
-        _raise_gemini_error(exc, model)
+    except GeminiRateLimitError:
+        logger.exception(
+            "Quota esgotada de forma persistente (após retries) | model=%s",
+            model,
+        )
         raise
 
     if not text:
@@ -384,16 +438,12 @@ async def call_claude_structured(
 async def call_claude_text(
     system_prompt: str,
     user_prompt: str,
-    max_tokens: int = 600,
+    max_tokens: int = 1024,
 ) -> str:
     """
     Gera uma resposta textual normal.
-
-    Mantém o nome antigo 'call_claude_text'
-    para preservar compatibilidade com o agente.
     """
 
-    client = _get_client()
     model = _get_model_name()
 
     logger.info(
@@ -402,7 +452,7 @@ async def call_claude_text(
     )
 
     try:
-        response = client.models.generate_content(
+        response = await _generate(
             model=model,
             contents=user_prompt,
             config=types.GenerateContentConfig(
@@ -413,13 +463,18 @@ async def call_claude_text(
 
         text = (response.text or "").strip()
 
-    except Exception as exc:
+    except GeminiFatalError:
         logger.exception(
-            "Erro na chamada de texto ao Gemini | model=%s",
+            "Erro fatal na chamada de texto ao Gemini | model=%s",
             model,
         )
+        raise
 
-        _raise_gemini_error(exc, model)
+    except GeminiRateLimitError:
+        logger.exception(
+            "Quota esgotada de forma persistente (após retries) | model=%s",
+            model,
+        )
         raise
 
     if not text:
@@ -429,6 +484,7 @@ async def call_claude_text(
 
     logger.info(
         "Gemini respondeu | model=%s | caracteres=%d",
+        model,
         len(text),
     )
 
@@ -448,7 +504,7 @@ def get_gemini_status() -> dict:
         "provider": "google-gemini",
         "sdk": "google-genai",
         "model": _get_model_name(),
+        "rpm_limit": GEMINI_RPM,
         "env_file": str(ENV_FILE),
         "api_key_configured": bool(GEMINI_API_KEY),
     }
-

@@ -28,6 +28,7 @@ from fastapi import FastAPI
 
 from app.api.routes_feed import router as feed_router
 from app.api.routes_init import router as init_router
+from app.api.routes_tick import router as tick_router
 from app.scheduling.scheduler import shutdown_scheduler, start_scheduler
 from app.storage.db import dispose_engine, init_db
 
@@ -43,7 +44,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
     # shutdown
     logger.info("A encerrar agendador e conexões...")
-    shutdown_scheduler()
+    await shutdown_scheduler()
     await dispose_engine()
 
 
@@ -55,6 +56,7 @@ app = FastAPI(
 
 app.include_router(init_router)
 app.include_router(feed_router)
+app.include_router(tick_router)
 
 
 @app.get("/health")

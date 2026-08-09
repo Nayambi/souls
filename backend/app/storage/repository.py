@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.storage.db import get_session
 from app.storage.models import Agent, Post, TopicSeen
@@ -50,6 +50,69 @@ async def get_agent(agent_id: str) -> Agent | None:
     async with get_session() as session:
         result = await session.execute(select(Agent).where(Agent.id == agent_id))
         return result.scalar_one_or_none()
+
+
+# ---------------------------------------------------------------------------
+# Agendamento (next_cycle_at)
+# ---------------------------------------------------------------------------
+
+async def set_next_cycle_at(agent_id: str, when: datetime) -> None:
+    """
+    Define/sobrescreve o próximo instante de ciclo de um agente. Escrita
+    atómica única — usada tanto para o agendamento inicial (routes_init)
+    como para o reagendamento no fim de cada ciclo (agent_cycle).
+    """
+    async with get_session() as session:
+        async with session.begin():
+            await session.execute(
+                update(Agent).where(Agent.id == agent_id).values(next_cycle_at=when)
+            )
+
+
+async def claim_due_agent_ids(
+    now: datetime,
+    limit: int = 50,
+    claim_horizon: timedelta = timedelta(minutes=30),
+) -> list[str]:
+    """
+    Reivindica atomicamente até `limit` agentes cujo next_cycle_at já passou.
+
+    Isto é UM único statement SQL (UPDATE ... WHERE id IN (SELECT ...
+    LIMIT ...) RETURNING id): sob o modelo de escritor único do SQLite,
+    um UPDATE é executado como uma unidade indivisível relativamente a
+    outros escritores, portanto não há uma janela entre "ver quem está
+    devido" e "marcar como reivindicado" em que dois tick concorrentes
+    (o poller interno e uma chamada manual a /api/agent/tick, por
+    exemplo) possam reivindicar o mesmo agente.
+
+    O "claim" empurra next_cycle_at para `now + claim_horizon` como
+    marcador provisório — isto garante que, mesmo que o ciclo falhe a
+    meio (processo morre, excepção não apanhada), o agente não fica
+    devido para sempre nem é reivindicado de novo instantaneamente; o
+    fim do ciclo (run_publishing_cycle, num finally) substitui este
+    marcador provisório pelo próximo ciclo real, aleatório entre 45min
+    e 3h.
+    """
+    if limit <= 0:
+        return []
+
+    claimed_until = now + claim_horizon
+
+    async with get_session() as session:
+        async with session.begin():
+            due_subquery = (
+                select(Agent.id)
+                .where(Agent.next_cycle_at.is_not(None), Agent.next_cycle_at <= now)
+                .order_by(Agent.next_cycle_at.asc())
+                .limit(limit)
+            )
+            result = await session.execute(
+                update(Agent)
+                .where(Agent.id.in_(due_subquery))
+                .values(next_cycle_at=claimed_until)
+                .returning(Agent.id)
+            )
+            return list(result.scalars().all())
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +211,33 @@ async def get_recent_topic_keys(agent_id: str, limit: int = 100) -> set[str]:
             .limit(limit)
         )
         return set(result.scalars().all())
+
+
+async def get_recent_published_posts(agent_id: str, limit: int = 5) -> list[PostRecord]:
+    """
+    Devolve os últimos posts publicados, com o TEXTO COMPLETO (não só o
+    título). Usado pelo writer para calibrar ângulo/estilo e evitar
+    repetir conteúdo já publicado — um resumo de título não chega para
+    isso, o writer precisa de ver o que já foi efetivamente escrito.
+    """
+    async with get_session() as session:
+        result = await session.execute(
+            select(Post)
+            .where(Post.agent_id == agent_id)
+            .order_by(Post.created_at.desc())
+            .limit(limit)
+        )
+        posts = result.scalars().all()
+        return [
+            PostRecord(
+                id=p.id,
+                created_at=p.created_at,
+                text=p.text,
+                rationale=p.rationale,
+                sources=json.loads(p.sources_json),
+            )
+            for p in posts
+        ]
 
 
 async def get_recent_published_summaries(agent_id: str, limit: int = 10) -> list[str]:

@@ -1,146 +1,97 @@
 """
-Scheduler responsável pelos ciclos autónomos de publicação.
+Poller interno responsável por disparar os ciclos autónomos de publicação.
 
-IMPORTANTE:
-O APScheduler utiliza uma BD SQLite própria (scheduler.db).
-A aplicação utiliza agent.db para os dados de negócio.
+Desenho:
+Em vez de um job do APScheduler por agente (um scheduler persistente,
+com a sua própria BD, um trigger por agent_id), há agora UM único loop
+assíncrono leve, correndo no mesmo event loop do servidor HTTP, que a
+cada POLLER_INTERVAL_SECONDS pergunta à BD "que agentes estão devidos
+agora?" (via claim_due_agent_ids, atómico) e corre o ciclo para cada um.
 
-Isto evita que o SQLAlchemy síncrono usado pelo APScheduler
-partilhe o mesmo ficheiro SQLite utilizado pelo SQLAlchemy async
-da aplicação.
+Isto simplifica bastante o modelo mental: não há jobstore persistido a
+gerir, não há uma segunda BD SQLite (scheduler.db deixa de ser
+necessária), e o intervalo real entre ciclos de um agente é decidido a
+cada fim de ciclo (agent_cycle.run_publishing_cycle), não por um
+trigger fixo — o que é o que permite ao intervalo ser 45min-3h
+aleatório em vez de um valor fixo com jitter.
+
+O mesmo efeito ("correr agora") também está disponível fora do loop
+periódico via POST /api/agent/tick (app/api/routes_tick.py), que chama
+run_due_cycles() diretamente — útil para testes/avaliação sem esperar
+o intervalo real.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
-
-from app.core.agent_cycle import run_publishing_cycle
-
+from app.core.agent_cycle import run_due_cycles
 
 logger = logging.getLogger("scheduler")
-
-
-# ---------------------------------------------------------------------------
-# DIRECTÓRIO DE DADOS
-# ---------------------------------------------------------------------------
-
-_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
-_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# JOBSTORE
-# ---------------------------------------------------------------------------
-#
-# NÃO utilizar agent.db aqui.
-#
-# agent.db:
-#   - agents
-#   - posts
-#   - topics_seen
-#
-# scheduler.db:
-#   - tabelas internas do APScheduler
-#
-# ---------------------------------------------------------------------------
-
-_SCHEDULER_DB = Path(
-    os.environ.get("SCHEDULER_DB_PATH", _DATA_DIR / "scheduler.db")
-)
-_SCHEDULER_DB.parent.mkdir(parents=True, exist_ok=True)
-
-_JOBSTORE_URL = f"sqlite:///{_SCHEDULER_DB}"
-
-
-scheduler = AsyncIOScheduler(
-    timezone="UTC",
-    jobstores={
-        "default": SQLAlchemyJobStore(
-            url=_JOBSTORE_URL
-        )
-    },
-    job_defaults={
-        "misfire_grace_time": 60 * 30,
-    },
-)
 
 
 # ---------------------------------------------------------------------------
 # CONFIGURAÇÃO
 # ---------------------------------------------------------------------------
 
-PUBLISH_INTERVAL_MINUTES = int(
-    os.environ.get(
-        "PUBLISH_INTERVAL_MINUTES",
-        4 * 60,
-    )
+# Cadência do loop interno — não é o intervalo entre posts de um agente
+# (esse é 45min-3h, decidido em agent_cycle.py). É apenas de quanto em
+# quanto tempo o poller verifica "há algum agente devido agora?". Um
+# valor baixo (60s) mantém a latência entre "ficar devido" e "correr"
+# pequena, sem custo relevante (a query é uma única UPDATE indexada).
+POLLER_INTERVAL_SECONDS = int(
+    os.environ.get("POLLER_INTERVAL_SECONDS", 60)
 )
 
-JITTER_SECONDS = int(
-    os.environ.get(
-        "PUBLISH_JITTER_SECONDS",
-        45 * 60,
-    )
-)
-
-FIRST_RUN_DELAY_SECONDS = int(
-    os.environ.get(
-        "FIRST_RUN_DELAY_SECONDS",
-        30,
-    )
+# Nº máximo de agentes reivindicados por tick (proteção contra um pico
+# de agentes todos devidos ao mesmo tempo bloquear o poller demasiado
+# tempo numa única iteração).
+MAX_AGENTS_PER_TICK = int(
+    os.environ.get("MAX_AGENTS_PER_TICK", 50)
 )
 
 
 # ---------------------------------------------------------------------------
-# AGENDAMENTO
+# LOOP
 # ---------------------------------------------------------------------------
 
-def schedule_agent_publishing(agent_id: str) -> None:
-    """
-    Agenda o ciclo autónomo de publicação para um agente.
+_poller_task: asyncio.Task[None] | None = None
+_stop_event: asyncio.Event | None = None
 
-    O primeiro ciclo ocorre após FIRST_RUN_DELAY_SECONDS.
-    Os seguintes ocorrem de acordo com PUBLISH_INTERVAL_MINUTES.
-    """
 
-    if not agent_id:
-        raise ValueError("agent_id não pode estar vazio.")
-
-    first_run = (
-        datetime.now(timezone.utc)
-        + timedelta(seconds=FIRST_RUN_DELAY_SECONDS)
-    )
-
-    job_id = f"publish-{agent_id}"
-
-    scheduler.add_job(
-        run_publishing_cycle,
-        trigger=IntervalTrigger(
-            minutes=PUBLISH_INTERVAL_MINUTES,
-            jitter=JITTER_SECONDS,
-        ),
-        args=[agent_id],
-        id=job_id,
-        next_run_time=first_run,
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
-
+async def _poll_loop(stop_event: asyncio.Event) -> None:
     logger.info(
-        "Job de publicação agendado | agent_id=%s | "
-        "primeiro ciclo=%s | intervalo=%d min",
-        agent_id,
-        first_run.isoformat(),
-        PUBLISH_INTERVAL_MINUTES,
+        "Poller interno arrancado | intervalo=%ds | max_por_tick=%d",
+        POLLER_INTERVAL_SECONDS,
+        MAX_AGENTS_PER_TICK,
     )
+
+    while not stop_event.is_set():
+        try:
+            processed = await run_due_cycles(limit=MAX_AGENTS_PER_TICK)
+
+            if processed:
+                logger.info(
+                    "Poller: %d ciclo(s) de publicação corridos.",
+                    processed,
+                )
+
+        except Exception:
+            # Um erro no tick não pode matar o loop — a próxima iteração
+            # tenta de novo. Erros de um agente específico já são
+            # apanhados dentro de run_publishing_cycle.
+            logger.exception("Erro inesperado no poller interno.")
+
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=POLLER_INTERVAL_SECONDS
+            )
+        except asyncio.TimeoutError:
+            pass  # cadência normal — volta a correr o tick
+
+    logger.info("Poller interno parado.")
 
 
 # ---------------------------------------------------------------------------
@@ -149,41 +100,40 @@ def schedule_agent_publishing(agent_id: str) -> None:
 
 def start_scheduler() -> None:
     """
-    Inicia o APScheduler e restaura jobs persistidos.
+    Arranca o poller interno como uma asyncio.Task no event loop
+    corrente. Tem de ser chamado a partir de dentro de um loop a correr
+    (o lifespan do FastAPI, por exemplo) — não faz sentido standalone.
     """
+    global _poller_task, _stop_event
 
-    if scheduler.running:
-        logger.info("Scheduler já estava em execução.")
+    if _poller_task is not None and not _poller_task.done():
+        logger.info("Poller já estava em execução.")
         return
 
-    scheduler.start()
-
-    jobs = scheduler.get_jobs()
-
-    logger.info(
-        "Scheduler iniciado | jobs restaurados=%d | db=%s",
-        len(jobs),
-        _SCHEDULER_DB,
-    )
-
-    for job in jobs:
-        logger.info(
-            "Job restaurado | id=%s | próxima execução=%s",
-            job.id,
-            job.next_run_time,
-        )
+    _stop_event = asyncio.Event()
+    _poller_task = asyncio.create_task(_poll_loop(_stop_event))
 
 
-def shutdown_scheduler() -> None:
+async def shutdown_scheduler() -> None:
     """
-    Encerra o scheduler.
+    Sinaliza o loop para parar e espera que a iteração corrente termine
+    antes de devolver — evita "Task was destroyed but it is pending"
+    no shutdown do servidor.
     """
+    global _poller_task, _stop_event
 
-    if not scheduler.running:
+    if _stop_event is None or _poller_task is None:
         return
 
-    logger.info("A encerrar scheduler...")
+    logger.info("A encerrar poller interno...")
 
-    scheduler.shutdown(wait=False)
+    _stop_event.set()
 
-    logger.info("Scheduler encerrado.")
+    try:
+        await asyncio.wait_for(_poller_task, timeout=10)
+    except asyncio.TimeoutError:
+        logger.warning("Poller não parou a tempo, a cancelar à força.")
+        _poller_task.cancel()
+
+    _poller_task = None
+    _stop_event = None

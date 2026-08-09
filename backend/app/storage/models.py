@@ -38,6 +38,14 @@ class Agent(Base):
     persona_domain: Mapped[str] = mapped_column(String(200), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
+    # Próximo instante em que o poller interno deve correr um ciclo de
+    # publicação para este agente. NULL = ainda não agendado (nenhum ciclo
+    # corre até algo definir este valor). Indexado porque é o campo usado
+    # pelo claim atómico (WHERE next_cycle_at <= :now) a cada tick.
+    next_cycle_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
     posts: Mapped[list["Post"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
     topics_seen: Mapped[list["TopicSeen"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
 
